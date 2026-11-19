@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OpsHub Web Frontend - Infraestructura Cloud en AWS para SPA Angular 21.
+  Alojamiento estático en Amazon S3 acelerado con Amazon CloudFront CDN (HTTPS),
+  Origin Access Control (OAC) y soporte para enrutamiento SPA (reescritura 403/404 a index.html).
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Entorno de despliegue para el portal web corporativo.
+
+  ProjectName:
+    Type: String
+    Default: opshub-web
+    Description: Prefijo para los recursos de infraestructura AWS.
+
+Resources:
+  # 1. Bucket privado Amazon S3 para almacenar los artefactos compilados de Angular (dist/web/browser)
+  OpsHubWebS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Stage}-${AWS::AccountId}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # 2. Origin Access Control (OAC) moderno para CloudFront (reemplazo seguro de OAI)
+  OpsHubWebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${Stage}-OAC"
+        Description: "Control de Acceso de Origen para portal Angular OpsHub"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # 3. Política del Bucket S3: solo permite lectura a la distribución de CloudFront vía OAC
+  OpsHubWebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OpsHubWebS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${OpsHubWebS3Bucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${OpsHubWebCloudFrontDistribution}"
+
+  # 4. Distribución Global de Amazon CloudFront con CDN y reglas de enrutamiento SPA
+  OpsHubWebCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "OpsHub Web Portal (${Stage}) - Angular 21 CDN"
+        Enabled: true
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100 # Cobertura económica Norteamérica y Sudamérica
+
+        # Origen apuntando al Bucket S3 con OAC
+        Origins:
+          - Id: S3OriginOpsHubWeb
+            DomainName: !GetAtt OpsHubWebS3Bucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OpsHubWebOriginAccessControl.Id
+            S3OriginConfig: {}
+
+        # Comportamiento de caché por defecto (HTTPS obligatorio + Gzip/Brotli)
+        DefaultCacheBehavior:
+          TargetOriginId: S3OriginOpsHubWeb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          # CachePolicyId: Managed-CachingOptimized (AWS Managed Policy ID)
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        # Manejo de enrutamiento SPA de Angular:
+        # Cualquier ruta cliente (/tickets, /feedback, /dashboard) reescrita a index.html (HTTP 200)
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+Outputs:
+  S3BucketName:
+    Description: "Nombre del bucket S3 de almacenamiento de artefactos Angular"
+    Value: !Ref OpsHubWebS3Bucket
+
+  CloudFrontDistributionId:
+    Description: "ID de la distribución CloudFront para invalidación de caché"
+    Value: !Ref OpsHubWebCloudFrontDistribution
+
+  CloudFrontDomainName:
+    Description: "Nombre de dominio global de CloudFront (HTTPS)"
+    Value: !GetAtt OpsHubWebCloudFrontDistribution.DomainName
+
+  PortalWebsiteUrl:
+    Description: "URL pública para acceder al portal OpsHub en producción"
+    Value: !Sub "https://${OpsHubWebCloudFrontDistribution.DomainName}"
